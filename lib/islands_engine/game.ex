@@ -1,7 +1,8 @@
 defmodule IslandsEngine.Game do
-  use GenServer
+  use GenServer, start: {__MODULE__, :start_link, []}, restart: :transient
   alias IslandsEngine.{Board, Coordinate, Guesses, Island, Rules}
   @players [:player1, :player2]
+  @timeout 60 * 60 * 24 * 1000
 
   # API
   def start_link(name) when is_binary(name) do
@@ -26,11 +27,23 @@ defmodule IslandsEngine.Game do
 
   def via_tuple(name), do: {:via, Registry, {Registry.Game, name}}
 
+  # customize default GenServer terminate function,
+  # to delete the game state ONLY if a timeout happens
+  def terminate({:shutdown, :timeout}, state_data) do
+    :ets.delete(:game_state, state_data.player1.name)
+    :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
+
   # Server
+
+  # send GenServer an async message to formally check/set game state,
+  # and in the meantime default to a fresh state
+  # this is to complete the GameSupervisor.start_game function (which is synchronous)
   def init(name) do
-    player1 = %{name: name, board: Board.new(), guesses: Guesses.new()}
-    player2 = %{name: nil, board: Board.new(), guesses: Guesses.new()}
-    {:ok, %{player1: player1, player2: player2, rules: %Rules{}}}
+    send(self(), {:set_state, name})
+    {:ok, fresh_state(name)}
   end
 
   def handle_call({:add_player, name}, _from, state_data) do
@@ -96,6 +109,24 @@ defmodule IslandsEngine.Game do
     end
   end
 
+  def handle_info(:timeout, state_data) do
+    # :stop calls GenServer.terminate, passing in {:shutdown, :timeout} as the first argument (reason).
+    {:stop, {:shutdown, :timeout}, state_data}
+  end
+
+  # Async call during game initialization
+  # Formally set the game state to either: new game, or existing game (if crashed)
+  def handle_info({:set_state, name}, _state_data) do
+    state_data =
+      case :ets.lookup(:game_state, name) do
+        [] -> fresh_state(name)
+        [{_key, state}] -> state
+      end
+
+    :ets.insert(:game_state, {name, state_data})
+    {:noreply, state_data, @timeout}
+  end
+
   # Helpers
 
   defp update_player2_name(state_data, name) do
@@ -115,7 +146,9 @@ defmodule IslandsEngine.Game do
   end
 
   defp reply_success(state_data, reply) do
-    {:reply, reply, state_data}
+    # update the saved game data. player1.name refers to the 
+    :ets.insert(:game_state, {state_data.player1.name, state_data})
+    {:reply, reply, state_data, @timeout}
   end
 
   defp opponent(:player1), do: :player2
@@ -125,5 +158,11 @@ defmodule IslandsEngine.Game do
     update_in(state_data[player_key].guesses, fn guesses ->
       Guesses.add(guesses, hit_or_miss, coordinate)
     end)
+  end
+
+  defp fresh_state(name) do
+    player1 = %{name: name, board: Board.new(), guesses: Guesses.new()}
+    player2 = %{name: nil, board: Board.new(), guesses: Guesses.new()}
+    %{player1: player1, player2: player2, rules: %Rules{}}
   end
 end
